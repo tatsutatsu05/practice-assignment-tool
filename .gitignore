@@ -1,0 +1,15 @@
+# Pythonの仮想環境
+.venv/
+
+# Pythonが自動生成するファイル
+__pycache__/
+*.pyc
+
+# 振り分け結果
+output/
+
+# 実際のGoogleフォーム回答
+data/responses.csv
+
+# 手動確定者の情報
+data/manual_assignments.csv
