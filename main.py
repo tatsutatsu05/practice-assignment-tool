@@ -1,314 +1,471 @@
 import csv
 import random
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 
-# =========================
-# ファイルや設定
-# =========================
-
 BASE_DIR = Path(__file__).parent
-
 DATA_FILE = BASE_DIR / "data" / "responses.csv"
 MANUAL_FILE = BASE_DIR / "data" / "manual_assignments.csv"
-
 OUTPUT_DIR = BASE_DIR / "output"
+PRACTICE_RESULT_FILE = OUTPUT_DIR / "assignment_results.csv"
+EVENT_RESULT_FILE = OUTPUT_DIR / "event_results.csv"
 
-PRACTICE_RESULT_FILE = (
-    OUTPUT_DIR / "assignment_results.csv"
-)
-
-EVENT_RESULT_FILE = (
-    OUTPUT_DIR / "event_results.csv"
-)
-
-
-# Googleフォームの列名
 NAME_COLUMN = "お名前"
-
-LINE_NAME_COLUMN = (
-    "LINE名（正確にお願いします）"
-)
-
-SCHEDULE_COLUMN = (
-    "参加したい練習日程(一部10時からの枠があります)"
-)
-
+LINE_NAME_COLUMN = "LINE名（正確にお願いします）"
+SCHEDULE_COLUMN = "参加したい練習日程(一部10時からの枠があります)"
 EVENT_COLUMN = "参加したいイベント"
 
-
-# 幹部1人分を除いた一般応募者の定員
 VENUE_CAPACITIES = {
     "成城": 9,
     "高島平": 9,
     "学芸大学": 17,
 }
 
-
-# 開発中は毎回同じ抽選結果にする
 RANDOM_SEED = 42
+TIE_BREAK_RANGE = 1000
 
-
-# =========================
-# 共通処理
-# =========================
 
 def split_choices(text):
-    """
-    Googleフォームの複数選択回答を、
-    1件ずつのリストに分解する。
-    """
-
-    if not text:
-        return []
-
     return [
-        choice.strip()
-        for choice in text.split(",")
-        if choice.strip()
+        item.strip()
+        for item in (text or "").split(",")
+        if item.strip()
     ]
 
 
 def get_capacity(schedule):
-    """
-    日程名から会場を判定し、
-    一般応募者の定員を返す。
-    """
-
     for venue, capacity in VENUE_CAPACITIES.items():
         if venue in schedule:
             return capacity
-
-    raise ValueError(
-        f"会場を判定できませんでした：{schedule}"
-    )
+    raise ValueError(f"会場を判定できませんでした：{schedule}")
 
 
-def format_participant(
-    name,
-    participant_line_names,
-):
-    """
-    本名とLINE名を表示用の文字列にする。
-    """
+def format_person(name, line_names):
+    return f"{name}（LINE名：{line_names[name]}）"
 
-    line_name = participant_line_names.get(
-        name,
-        "未登録",
-    )
-
-    return f"{name}（LINE名：{line_name}）"
-
-
-# =========================
-# Googleフォーム回答の読み込み
-# =========================
 
 def load_responses():
-    """
-    Googleフォーム回答CSVを読み込む。
-
-    戻り値：
-    ・日程ごとの練習応募者
-    ・イベントごとの応募者
-    ・本名とLINE名の対応表
-    """
-
     schedule_applicants = defaultdict(list)
     event_applicants = defaultdict(list)
+    line_names = {}
+    schedule_seen = defaultdict(set)
+    event_seen = defaultdict(set)
 
-    participant_line_names = {}
-
-    with DATA_FILE.open(
-        mode="r",
-        encoding="utf-8-sig",
-        newline="",
-    ) as file:
+    with DATA_FILE.open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
 
-        for response in reader:
-            name = (
-                response.get(NAME_COLUMN) or ""
-            ).strip()
-
-            line_name = (
-                response.get(LINE_NAME_COLUMN) or ""
-            ).strip()
-
-            schedules_text = (
-                response.get(SCHEDULE_COLUMN) or ""
-            ).strip()
-
-            events_text = (
-                response.get(EVENT_COLUMN) or ""
-            ).strip()
-
-            # 本名が空欄なら処理しない
-            if not name:
-                continue
-
-            # LINE名が空欄ならエラー
-            if not line_name:
-                raise ValueError(
-                    f"{name}さんのLINE名が空欄です。"
-                )
-
-            # 同じ本名で異なるLINE名が登録されていたらエラー
-            if name in participant_line_names:
-                registered_line_name = (
-                    participant_line_names[name]
-                )
-
-                if registered_line_name != line_name:
-                    raise ValueError(
-                        f"{name}さんについて、"
-                        "異なるLINE名が登録されています。"
-                        f"「{registered_line_name}」と"
-                        f"「{line_name}」"
-                    )
-
-            participant_line_names[name] = line_name
-
-            # 練習日程を日程ごとに整理する
-            for schedule in split_choices(
-                schedules_text
-            ):
-                schedule_applicants[schedule].append(
-                    name
-                )
-
-            # イベントをイベントごとに整理する
-            for event in split_choices(events_text):
-                event_applicants[event].append(name)
-
-    return (
-        schedule_applicants,
-        event_applicants,
-        participant_line_names,
-    )
-
-
-# =========================
-# 手動確定ファイルの読み込み
-# =========================
-
-def load_manual_assignments():
-    """
-    手動で確定する練習参加者を
-    CSVから読み込む。
-    """
-
-    manual_assignments = defaultdict(list)
-
-    with MANUAL_FILE.open(
-        mode="r",
-        encoding="utf-8-sig",
-        newline="",
-    ) as file:
-        reader = csv.DictReader(file)
+        required = {
+            NAME_COLUMN,
+            LINE_NAME_COLUMN,
+            SCHEDULE_COLUMN,
+            EVENT_COLUMN,
+        }
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                "responses.csvに必要な列がありません："
+                + ", ".join(sorted(missing))
+            )
 
         for row in reader:
-            schedule = (
-                row.get("schedule") or ""
-            ).strip()
+            name = (row.get(NAME_COLUMN) or "").strip()
+            line_name = (row.get(LINE_NAME_COLUMN) or "").strip()
 
-            name = (
-                row.get("name") or ""
-            ).strip()
+            if not name:
+                continue
+            if not line_name:
+                raise ValueError(f"{name}さんのLINE名が空欄です。")
 
-            # 完全な空行は無視する
+            if name in line_names and line_names[name] != line_name:
+                raise ValueError(
+                    f"{name}さんに異なるLINE名があります："
+                    f"「{line_names[name]}」「{line_name}」"
+                )
+            line_names[name] = line_name
+
+            for schedule in split_choices(row.get(SCHEDULE_COLUMN)):
+                if name not in schedule_seen[schedule]:
+                    schedule_applicants[schedule].append(name)
+                    schedule_seen[schedule].add(name)
+
+            for event in split_choices(row.get(EVENT_COLUMN)):
+                if name not in event_seen[event]:
+                    event_applicants[event].append(name)
+                    event_seen[event].add(name)
+
+    return schedule_applicants, event_applicants, line_names
+
+
+def load_manual_assignments():
+    manual = defaultdict(list)
+
+    if not MANUAL_FILE.exists():
+        return manual
+
+    with MANUAL_FILE.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+
+        if set(reader.fieldnames or []) != {"schedule", "name"}:
+            raise ValueError(
+                "manual_assignments.csvの見出しは"
+                "「schedule,name」にしてください。"
+            )
+
+        for row in reader:
+            schedule = (row.get("schedule") or "").strip()
+            name = (row.get("name") or "").strip()
+
             if not schedule and not name:
                 continue
-
-            # 片方だけ空欄ならエラー
             if not schedule or not name:
                 raise ValueError(
-                    "manual_assignments.csvに、"
-                    "日程または名前が空欄の行があります。"
+                    "manual_assignments.csvに空欄の項目があります。"
                 )
 
-            manual_assignments[schedule].append(
-                name
-            )
+            manual[schedule].append(name)
 
-    return manual_assignments
+    return manual
 
 
-# =========================
-# 手動確定内容の確認
-# =========================
-
-def validate_manual_assignments(
-    schedule_applicants,
-    manual_assignments,
-):
-    """
-    手動確定の内容に間違いがないか確認する。
-    """
-
-    for schedule, names in (
-        manual_assignments.items()
-    ):
-        # 日程が応募データに存在するか
+def validate_manual(schedule_applicants, manual):
+    for schedule, names in manual.items():
         if schedule not in schedule_applicants:
             raise ValueError(
-                "手動確定の日程が"
-                "応募データにありません："
-                f"{schedule}"
+                f"手動確定の日程が応募データにありません：{schedule}"
             )
-
-        # 同じ日程で同じ人が重複していないか
         if len(names) != len(set(names)):
             raise ValueError(
-                "同じ人が重複して"
-                "手動確定されています："
-                f"{schedule}"
+                f"同じ人が重複して手動確定されています：{schedule}"
             )
 
-        applicants = schedule_applicants[schedule]
-
-        # その日程に応募した人か
+        applicants = set(schedule_applicants[schedule])
         for name in names:
             if name not in applicants:
                 raise ValueError(
-                    f"{name}さんは"
-                    f"「{schedule}」に"
-                    "応募していません。"
+                    f"{name}さんは「{schedule}」に応募していません。"
                 )
 
-        capacity = get_capacity(schedule)
-
-        # 手動確定者だけで定員超過していないか
-        if len(names) > capacity:
+        if len(names) > get_capacity(schedule):
             raise ValueError(
-                "手動確定者が定員を"
-                "超えています："
-                f"{schedule}"
+                f"手動確定者が定員を超えています：{schedule}"
             )
 
 
-# =========================
-# 練習結果のCSV保存
-# =========================
+class Edge:
+    def __init__(self, to, reverse_index, capacity, cost):
+        self.to = to
+        self.reverse_index = reverse_index
+        self.capacity = capacity
+        self.cost = cost
+
+
+class MinCostMaxFlow:
+    def __init__(self, node_count):
+        self.graph = [[] for _ in range(node_count)]
+
+    def add_edge(self, source, target, capacity, cost):
+        forward = Edge(
+            target,
+            len(self.graph[target]),
+            capacity,
+            cost,
+        )
+        backward = Edge(
+            source,
+            len(self.graph[source]),
+            0,
+            -cost,
+        )
+        self.graph[source].append(forward)
+        self.graph[target].append(backward)
+        return forward
+
+    def run(self, source, sink, required_flow):
+        flow = 0
+        cost = 0
+        node_count = len(self.graph)
+
+        while flow < required_flow:
+            distance = [None] * node_count
+            previous_node = [-1] * node_count
+            previous_edge = [-1] * node_count
+            in_queue = [False] * node_count
+
+            distance[source] = 0
+            queue = deque([source])
+            in_queue[source] = True
+
+            while queue:
+                node = queue.popleft()
+                in_queue[node] = False
+
+                for edge_index, edge in enumerate(self.graph[node]):
+                    if edge.capacity <= 0:
+                        continue
+
+                    new_distance = distance[node] + edge.cost
+                    if (
+                        distance[edge.to] is None
+                        or new_distance < distance[edge.to]
+                    ):
+                        distance[edge.to] = new_distance
+                        previous_node[edge.to] = node
+                        previous_edge[edge.to] = edge_index
+
+                        if not in_queue[edge.to]:
+                            queue.append(edge.to)
+                            in_queue[edge.to] = True
+
+            if previous_node[sink] == -1:
+                break
+
+            added = required_flow - flow
+            node = sink
+
+            while node != source:
+                prev = previous_node[node]
+                edge = self.graph[prev][previous_edge[node]]
+                added = min(added, edge.capacity)
+                node = prev
+
+            node = sink
+
+            while node != source:
+                prev = previous_node[node]
+                edge = self.graph[prev][previous_edge[node]]
+                edge.capacity -= added
+                self.graph[node][edge.reverse_index].capacity += added
+                node = prev
+
+            flow += added
+            cost += distance[sink] * added
+
+        return flow, cost
+
+
+def optimize_assignments(schedule_applicants, manual):
+    selected = defaultdict(list)
+    rejected = defaultdict(list)
+    counts = Counter()
+    methods = {}
+    oversubscribed = {}
+
+    # 0回の人も公平性評価に含める
+    for applicants in schedule_applicants.values():
+        for name in applicants:
+            counts[name] = 0
+
+    # 定員内の日程は全員参加として先に確定
+    for schedule, applicants in schedule_applicants.items():
+        manual_names = set(manual.get(schedule, []))
+
+        if len(applicants) <= get_capacity(schedule):
+            selected[schedule] = applicants.copy()
+
+            for name in applicants:
+                counts[name] += 1
+                methods[(schedule, name)] = (
+                    "手動確定"
+                    if name in manual_names
+                    else "定員内確定"
+                )
+        else:
+            oversubscribed[schedule] = applicants.copy()
+
+    # 定員超過日程の手動確定者を固定
+    for schedule in oversubscribed:
+        for name in manual.get(schedule, []):
+            selected[schedule].append(name)
+            counts[name] += 1
+            methods[(schedule, name)] = "手動確定"
+
+    remaining_capacity = {}
+    candidate_schedules = defaultdict(list)
+
+    # 定員超過の全日程を、まとめて最適化する準備
+    for schedule, applicants in oversubscribed.items():
+        fixed = set(manual.get(schedule, []))
+        remaining_capacity[schedule] = (
+            get_capacity(schedule) - len(fixed)
+        )
+
+        if remaining_capacity[schedule] <= 0:
+            continue
+
+        for name in applicants:
+            if name not in fixed:
+                candidate_schedules[name].append(schedule)
+
+    required_flow = sum(remaining_capacity.values())
+
+    if required_flow:
+        people = sorted(candidate_schedules)
+        schedules = sorted(remaining_capacity)
+
+        source = 0
+        person_start = 1
+        schedule_start = person_start + len(people)
+        sink = schedule_start + len(schedules)
+
+        person_node = {
+            name: person_start + index
+            for index, name in enumerate(people)
+        }
+        schedule_node = {
+            schedule: schedule_start + index
+            for index, schedule in enumerate(schedules)
+        }
+
+        solver = MinCostMaxFlow(sink + 1)
+
+        # 公平性を抽選用乱数より必ず優先させる
+        fairness_base = required_flow + 1
+        tie_scale = required_flow * TIE_BREAK_RANGE + 1
+
+        # 1人の1回目、2回目、3回目…ほど費用を大きくする。
+        # これにより、まず参加0回の人を減らし、
+        # 次に1回の人を減らす、という順で全体を公平化する。
+        for name in people:
+            current_count = counts[name]
+            possible_count = len(candidate_schedules[name])
+
+            for extra_index in range(possible_count):
+                level = current_count + extra_index
+                fairness_cost = fairness_base ** level
+
+                solver.add_edge(
+                    source,
+                    person_node[name],
+                    1,
+                    fairness_cost * tie_scale,
+                )
+
+        random_generator = random.Random(RANDOM_SEED)
+        pairs = [
+            (name, schedule)
+            for name, schedules_for_name in candidate_schedules.items()
+            for schedule in schedules_for_name
+        ]
+        random_generator.shuffle(pairs)
+
+        assignment_edges = {}
+
+        for name, schedule in pairs:
+            edge = solver.add_edge(
+                person_node[name],
+                schedule_node[schedule],
+                1,
+                random_generator.randrange(TIE_BREAK_RANGE),
+            )
+            assignment_edges[(name, schedule)] = edge
+
+        for schedule in schedules:
+            solver.add_edge(
+                schedule_node[schedule],
+                sink,
+                remaining_capacity[schedule],
+                0,
+            )
+
+        actual_flow, _ = solver.run(
+            source,
+            sink,
+            required_flow,
+        )
+
+        if actual_flow != required_flow:
+            raise RuntimeError(
+                "全枠を割り当てられませんでした。"
+                "応募データを確認してください。"
+            )
+
+        for schedule, applicants in oversubscribed.items():
+            selected_set = set(selected[schedule])
+
+            for name in applicants:
+                edge = assignment_edges.get((name, schedule))
+
+                if edge is not None and edge.capacity == 0:
+                    selected[schedule].append(name)
+                    selected_set.add(name)
+                    counts[name] += 1
+                    methods[(schedule, name)] = "全体最適化"
+
+            rejected[schedule] = [
+                name
+                for name in applicants
+                if name not in selected_set
+            ]
+
+    for schedule, applicants in oversubscribed.items():
+        if schedule not in rejected:
+            selected_set = set(selected[schedule])
+            rejected[schedule] = [
+                name
+                for name in applicants
+                if name not in selected_set
+            ]
+
+    return selected, rejected, counts, methods
+
+
+def validate_results(
+    schedule_applicants,
+    selected,
+    rejected,
+    manual,
+    counts,
+):
+    recalculated = Counter()
+
+    for applicants in schedule_applicants.values():
+        for name in applicants:
+            recalculated[name] = 0
+
+    for schedule, applicants in schedule_applicants.items():
+        selected_names = selected[schedule]
+        rejected_names = rejected[schedule]
+
+        if len(selected_names) > get_capacity(schedule):
+            raise RuntimeError(
+                f"定員超過が発生しています：{schedule}"
+            )
+        if set(selected_names) & set(rejected_names):
+            raise RuntimeError(
+                f"参加者と落選者が重複しています：{schedule}"
+            )
+        if (
+            set(selected_names) | set(rejected_names)
+            != set(applicants)
+        ):
+            raise RuntimeError(
+                f"応募者と結果が一致しません：{schedule}"
+            )
+        if not set(manual.get(schedule, [])) <= set(selected_names):
+            raise RuntimeError(
+                f"手動確定者が参加者にいません：{schedule}"
+            )
+
+        for name in selected_names:
+            recalculated[name] += 1
+
+    if recalculated != counts:
+        raise RuntimeError("参加回数の集計が一致しません。")
+
 
 def save_practice_results(
     schedule_applicants,
-    selected_participants,
-    rejected_participants,
-    manual_assignments,
-    participation_counts,
-    participant_line_names,
+    selected,
+    rejected,
+    counts,
+    line_names,
+    methods,
 ):
-    """
-    練習の振り分け結果を
-    CSVファイルとして保存する。
-    """
-
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     with PRACTICE_RESULT_FILE.open(
-        mode="w",
+        "w",
         encoding="utf-8-sig",
         newline="",
     ) as file:
@@ -320,85 +477,40 @@ def save_practice_results(
             "選出方法",
             "最終練習参加回数",
         ]
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames,
-        )
-
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
 
         for schedule in schedule_applicants:
-            manual_names = set(
-                manual_assignments.get(
-                    schedule,
-                    [],
-                )
-            )
-
-            # 参加者を保存
-            for name in selected_participants[
-                schedule
-            ]:
-                if name in manual_names:
-                    selection_method = "手動確定"
-                else:
-                    selection_method = "自動選出"
-
+            for name in selected[schedule]:
                 writer.writerow(
                     {
                         "日程": schedule,
                         "結果": "参加",
                         "本名": name,
-                        "LINE名": (
-                            participant_line_names[name]
-                        ),
-                        "選出方法": selection_method,
-                        "最終練習参加回数": (
-                            participation_counts[name]
-                        ),
+                        "LINE名": line_names[name],
+                        "選出方法": methods[(schedule, name)],
+                        "最終練習参加回数": counts[name],
                     }
                 )
 
-            # 落選者を保存
-            for name in rejected_participants[
-                schedule
-            ]:
+            for name in rejected[schedule]:
                 writer.writerow(
                     {
                         "日程": schedule,
                         "結果": "落選",
                         "本名": name,
-                        "LINE名": (
-                            participant_line_names[name]
-                        ),
-                        "選出方法": "自動抽選",
-                        "最終練習参加回数": (
-                            participation_counts[name]
-                        ),
+                        "LINE名": line_names[name],
+                        "選出方法": "全体最適化で未選出",
+                        "最終練習参加回数": counts[name],
                     }
                 )
 
 
-# =========================
-# イベント結果のCSV保存
-# =========================
-
-def save_event_results(
-    event_applicants,
-    participant_line_names,
-):
-    """
-    イベント参加者をCSVに保存する。
-
-    イベントは定員・抽選なしで、
-    応募者全員を参加とする。
-    """
-
+def save_event_results(event_applicants, line_names):
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     with EVENT_RESULT_FILE.open(
-        mode="w",
+        "w",
         encoding="utf-8-sig",
         newline="",
     ) as file:
@@ -409,310 +521,116 @@ def save_event_results(
             "LINE名",
             "結果",
         ]
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames,
-        )
-
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
 
-        for event, participants in (
-            event_applicants.items()
-        ):
-            participant_count = len(participants)
-
+        for event, participants in event_applicants.items():
             for name in participants:
                 writer.writerow(
                     {
                         "イベント": event,
-                        "参加者数": participant_count,
+                        "参加者数": len(participants),
                         "本名": name,
-                        "LINE名": (
-                            participant_line_names[name]
-                        ),
+                        "LINE名": line_names[name],
                         "結果": "参加",
                     }
                 )
 
 
-# =========================
-# メイン処理
-# =========================
+def main():
+    (
+        schedule_applicants,
+        event_applicants,
+        line_names,
+    ) = load_responses()
 
-random_generator = random.Random(RANDOM_SEED)
+    manual = load_manual_assignments()
+    validate_manual(schedule_applicants, manual)
 
-
-# Googleフォーム回答を読み込む
-(
-    schedule_applicants,
-    event_applicants,
-    participant_line_names,
-) = load_responses()
-
-
-# 手動確定ファイルを読み込む
-manual_assignments = load_manual_assignments()
-
-
-# 手動確定内容をチェックする
-validate_manual_assignments(
-    schedule_applicants,
-    manual_assignments,
-)
-
-
-# 日程ごとの練習参加者
-selected_participants = defaultdict(list)
-
-# 日程ごとの練習落選者
-rejected_participants = defaultdict(list)
-
-# 人ごとの練習参加回数
-participation_counts = Counter()
-
-# 定員超過の日程
-pending_schedules = {}
-
-
-# =========================
-# 定員内の日程を確定
-# =========================
-
-for schedule, applicants in (
-    schedule_applicants.items()
-):
-    capacity = get_capacity(schedule)
-
-    if len(applicants) <= capacity:
-        selected_participants[schedule] = (
-            applicants.copy()
-        )
-
-        for name in applicants:
-            participation_counts[name] += 1
-
-    else:
-        pending_schedules[schedule] = (
-            applicants.copy()
-        )
-
-
-# =========================
-# 手動確定者を先に登録
-# =========================
-
-for schedule in pending_schedules:
-    fixed_participants = (
-        manual_assignments.get(
-            schedule,
-            [],
+    selected, rejected, counts, methods = (
+        optimize_assignments(
+            schedule_applicants,
+            manual,
         )
     )
 
-    selected_participants[schedule].extend(
-        fixed_participants
+    validate_results(
+        schedule_applicants,
+        selected,
+        rejected,
+        manual,
+        counts,
     )
 
-    for name in fixed_participants:
-        participation_counts[name] += 1
+    print("練習の振り分け結果")
+    print("====================")
 
+    if not schedule_applicants:
+        print("練習への応募はありません。")
 
-# =========================
-# 残った練習枠を公平に抽選
-# =========================
+    for schedule in schedule_applicants:
+        print()
+        print(schedule)
+        print(f"定員：{get_capacity(schedule)}人")
+        print(f"応募者数：{len(schedule_applicants[schedule])}人")
+        print("【参加者】")
 
-for schedule, applicants in (
-    pending_schedules.items()
-):
-    capacity = get_capacity(schedule)
-
-    fixed_participants = (
-        manual_assignments.get(
-            schedule,
-            [],
-        )
-    )
-
-    fixed_participant_set = set(
-        fixed_participants
-    )
-
-    remaining_capacity = (
-        capacity - len(fixed_participants)
-    )
-
-    # 手動確定者を抽選対象から除く
-    lottery_candidates = [
-        name
-        for name in applicants
-        if name not in fixed_participant_set
-    ]
-
-    # 同じ参加回数の人の順番をランダム化
-    random_generator.shuffle(
-        lottery_candidates
-    )
-
-    # 現在の参加回数が少ない順に並べる
-    ranked_candidates = sorted(
-        lottery_candidates,
-        key=lambda name: participation_counts[name],
-    )
-
-    winners = ranked_candidates[
-        :remaining_capacity
-    ]
-
-    losers = ranked_candidates[
-        remaining_capacity:
-    ]
-
-    selected_participants[schedule].extend(
-        winners
-    )
-
-    rejected_participants[schedule] = losers
-
-    for name in winners:
-        participation_counts[name] += 1
-
-
-# =========================
-# 練習結果をターミナル表示
-# =========================
-
-print("練習の振り分け結果")
-print("====================")
-
-if not schedule_applicants:
-    print("練習への応募はありません。")
-
-for schedule in schedule_applicants:
-    participants = selected_participants[
-        schedule
-    ]
-
-    rejected = rejected_participants[
-        schedule
-    ]
-
-    manual_names = set(
-        manual_assignments.get(
-            schedule,
-            [],
-        )
-    )
-
-    print()
-    print(schedule)
-    print(f"定員：{get_capacity(schedule)}人")
-
-    print(
-        f"応募者数："
-        f"{len(schedule_applicants[schedule])}人"
-    )
-
-    print("【参加者】")
-
-    for name in participants:
-        participant_text = format_participant(
-            name,
-            participant_line_names,
-        )
-
-        if name in manual_names:
+        for name in selected[schedule]:
             print(
-                f"・{participant_text}"
-                "（手動確定）"
-            )
-        else:
-            print(f"・{participant_text}")
-
-    if rejected:
-        print("【落選者】")
-
-        for name in rejected:
-            participant_text = format_participant(
-                name,
-                participant_line_names,
+                f"・{format_person(name, line_names)}"
+                f"（{methods[(schedule, name)]}）"
             )
 
-            print(f"・{participant_text}")
+        if rejected[schedule]:
+            print("【落選者】")
+            for name in rejected[schedule]:
+                print(f"・{format_person(name, line_names)}")
 
-
-print()
-print("最終的な練習参加回数")
-print("====================")
-
-if not participation_counts:
-    print("練習参加者はいません。")
-
-for name, count in sorted(
-    participation_counts.items()
-):
-    participant_text = format_participant(
-        name,
-        participant_line_names,
-    )
-
-    print(f"{participant_text}：{count}回")
-
-
-# =========================
-# イベント結果をターミナル表示
-# =========================
-
-print()
-print("イベント参加希望者")
-print("====================")
-
-if not event_applicants:
-    print("イベントへの応募はありません。")
-
-for event, participants in (
-    event_applicants.items()
-):
     print()
-    print(event)
-    print(f"参加者数：{len(participants)}人")
-    print("【参加者・全員参加】")
+    print("最終的な練習参加回数")
+    print("====================")
 
-    for name in participants:
-        participant_text = format_participant(
-            name,
-            participant_line_names,
+    for name, count in sorted(counts.items()):
+        print(f"{format_person(name, line_names)}：{count}回")
+
+    if counts:
+        values = list(counts.values())
+        print()
+        print(
+            f"参加回数の最大差："
+            f"{max(values) - min(values)}回"
         )
 
-        print(f"・{participant_text}")
+    print()
+    print("イベント参加希望者")
+    print("====================")
+
+    if not event_applicants:
+        print("イベントへの応募はありません。")
+
+    for event, participants in event_applicants.items():
+        print()
+        print(event)
+        print(f"参加者数：{len(participants)}人")
+        print("【参加者・全員参加】")
+
+        for name in participants:
+            print(f"・{format_person(name, line_names)}")
+
+    save_practice_results(
+        schedule_applicants,
+        selected,
+        rejected,
+        counts,
+        line_names,
+        methods,
+    )
+    save_event_results(event_applicants, line_names)
+
+    print()
+    print(f"練習結果を保存しました：{PRACTICE_RESULT_FILE}")
+    print(f"イベント結果を保存しました：{EVENT_RESULT_FILE}")
 
 
-# =========================
-# CSVファイルとして保存
-# =========================
-
-save_practice_results(
-    schedule_applicants,
-    selected_participants,
-    rejected_participants,
-    manual_assignments,
-    participation_counts,
-    participant_line_names,
-)
-
-save_event_results(
-    event_applicants,
-    participant_line_names,
-)
-
-
-print()
-print(
-    "練習結果を保存しました："
-    f"{PRACTICE_RESULT_FILE}"
-)
-
-print(
-    "イベント結果を保存しました："
-    f"{EVENT_RESULT_FILE}"
-)
+if __name__ == "__main__":
+    main()
