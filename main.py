@@ -13,13 +13,13 @@ EVENT_RESULT_FILE = OUTPUT_DIR / "event_results.csv"
 
 NAME_COLUMN = "お名前"
 LINE_NAME_COLUMN = "LINE名（正確にお願いします）"
-SCHEDULE_COLUMN = "参加したい練習日程(一部10時からの枠があります)"
+SCHEDULE_COLUMN = "参加したい練習日程(開始時刻に注意してください)"
 EVENT_COLUMN = "参加したいイベント"
 
 VENUE_CAPACITIES = {
     "成城": 9,
     "高島平": 9,
-    "学芸大学": 17,
+    "学芸": 17,
 }
 
 RANDOM_SEED = 42
